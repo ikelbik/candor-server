@@ -6,9 +6,10 @@ const http      = require('http');
 const fs        = require('fs');
 const path      = require('path');
 
-const PORT         = process.env.PORT || 3001;
-const HEX_COUNT    = 18;          // positions per lobby
-const REVEAL_PAUSE = 6000;        // ms before new round starts
+const PORT           = process.env.PORT || 3001;
+const HEX_COUNT      = 18;    // positions per lobby
+const ROUND_DURATION = 60;    // seconds of betting phase
+const REVEAL_PAUSE   = 8000;  // ms before new round starts
 
 const BET_SIZES  = [10, 50, 100, 500, 1000];
 const MULTIPLIERS = [2, 3, 6];
@@ -55,6 +56,7 @@ function makeLobby(betSize, multiplier) {
     positions: new Map(), // hexNum (1-18) → { connId, isBot }
     phase:   'betting',   // 'betting' | 'reveal'
     roundId: crypto.randomBytes(4).toString('hex'),
+    timer:   ROUND_DURATION,
   };
 }
 
@@ -71,6 +73,26 @@ function lobbyPositionsArr(lobby) {
   );
   return arr;
 }
+
+// ─── Bot fill + draw ───────────────────────────────────────────────────────
+function fillBotsAndDraw(lobby) {
+  if (lobby.phase !== 'betting') return;
+  for (let h = 1; h <= HEX_COUNT; h++) {
+    if (!lobby.positions.has(h))
+      lobby.positions.set(h, { connId: null, isBot: true });
+  }
+  executeDraw(lobby);
+}
+
+// ─── Global tick (one interval drives all lobbies) ─────────────────────────
+setInterval(() => {
+  lobbies.forEach((lobby, key) => {
+    if (lobby.phase !== 'betting') return;
+    lobby.timer--;
+    broadcastToLobby(key, { type: 'timer', lobbyKey: key, seconds: lobby.timer });
+    if (lobby.timer <= 0) fillBotsAndDraw(lobby);
+  });
+}, 1000);
 
 // ─── HTTP server ───────────────────────────────────────────────────────────
 const httpServer = http.createServer((req, res) => {
@@ -134,6 +156,7 @@ function executeDraw(lobby) {
       lobbyKey: lobby.key,
       roundId:  newLobby.roundId,
       hash:     newLobby.hash,
+      timer:    newLobby.timer,
     });
     console.log(`[NEW ROUND] lobby=${lobby.key} roundId=${newLobby.roundId}`);
   }, REVEAL_PAUSE);
@@ -172,6 +195,7 @@ wss.on('connection', ws => {
         multiplier:  lobby.multiplier,
         hash:        lobby.hash,
         phase:       lobby.phase,
+        timer:       lobby.timer,
         positions:   lobbyPositionsArr(lobby),
         playerCount: lobby.positions.size,
         totalSlots:  HEX_COUNT,
