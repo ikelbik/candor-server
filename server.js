@@ -3,113 +3,242 @@
 const WebSocket = require('ws');
 const crypto    = require('crypto');
 const http      = require('http');
+const fs        = require('fs');
+const path      = require('path');
 
-const PORT           = process.env.PORT || 3001;
-const ROUND_DURATION = 60;
-const REVEAL_PAUSE   = 8;
-const TOTAL          = 100;
+const PORT         = process.env.PORT || 3001;
+const HEX_COUNT    = 18;          // positions per lobby
+const REVEAL_PAUSE = 6000;        // ms before new round starts
 
-let roundId = 0;
+const BET_SIZES  = [10, 50, 100, 500, 1000];
+const MULTIPLIERS = [2, 3, 6];
 
-function makeRound() {
-  const seed   = crypto.randomBytes(16).toString('hex');
-  const secret = Math.floor(Math.random() * TOTAL);
-  const hash   = crypto.createHash('sha256')
-                       .update(`${seed}:${secret}`)
-                       .digest('hex');
-  roundId++;
+// ─── Math
+// Multiplier 2 → 9 winners,  9 losers  (18 total)
+// Multiplier 3 → 6 winners, 12 losers  (18 total)
+// Multiplier 6 → 3 winners, 15 losers  (18 total)
+// Each loser contributes betSize coins:
+//   1 coin goes to lottery fund, rest split equally among winners.
+//   perWinner = betSize + floor(loserCount * (betSize - 1) / winnerCount)
+
+// ─── Lobby state ───────────────────────────────────────────────────────────
+// key = "100x3"  →  lobby object
+const lobbies = new Map();
+
+function getLobbyKey(betSize, multiplier) {
+  return `${betSize}x${multiplier}`;
+}
+
+function generateWinningNumbers() {
+  // Shuffle 1..HEX_COUNT, take first 9
+  const arr = Array.from({ length: HEX_COUNT }, (_, i) => i + 1);
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr.slice(0, 9);
+}
+
+function makeLobby(betSize, multiplier) {
+  const seed           = crypto.randomBytes(16).toString('hex');
+  const winningNumbers = generateWinningNumbers();  // always 9
+  const hash           = crypto.createHash('sha256')
+    .update(`${seed}:${winningNumbers.join(',')}`)
+    .digest('hex');
   return {
-    roundId, seed, secret, hash,
-    positions: new Map(),
-    fund:  0,
-    timer: ROUND_DURATION,
-    phase: 'betting',
+    key: getLobbyKey(betSize, multiplier),
+    betSize,
+    multiplier,
+    seed,
+    winningNumbers,   // hidden until reveal
+    hash,             // committed to clients at round start
+    positions: new Map(), // hexNum (1-18) → { connId, isBot }
+    phase:   'betting',   // 'betting' | 'reveal'
+    roundId: crypto.randomBytes(4).toString('hex'),
   };
 }
 
-let game = makeRound();
-let tickInterval = null;
+function getOrCreateLobby(betSize, multiplier) {
+  const key = getLobbyKey(betSize, multiplier);
+  if (!lobbies.has(key)) lobbies.set(key, makeLobby(betSize, multiplier));
+  return lobbies.get(key);
+}
 
+function lobbyPositionsArr(lobby) {
+  const arr = [];
+  lobby.positions.forEach((v, hexNum) =>
+    arr.push({ hexNum, isBot: v.isBot || false })
+  );
+  return arr;
+}
+
+// ─── HTTP server ───────────────────────────────────────────────────────────
 const httpServer = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('Candor WebSocket server');
+  const filePath = path.join(__dirname, 'condor_index.html');
+  fs.readFile(filePath, (err, data) => {
+    if (err) { res.writeHead(500); res.end('Server error'); return; }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(data);
+  });
 });
 
+// ─── WebSocket server ──────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ server: httpServer });
-
-let connId = 0;
+let connIdSeq = 0;
 
 function send(ws, data) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 
-function broadcast(data) {
+function broadcastToLobby(key, data) {
   const msg = JSON.stringify(data);
-  wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN && c.lobbyKey === key) c.send(msg);
+  });
 }
 
-function startTick() {
-  clearInterval(tickInterval);
-  tickInterval = setInterval(() => {
-    game.timer--;
-    broadcast({ type: 'timer', seconds: game.timer });
-    if (game.timer <= 0) { clearInterval(tickInterval); endRound(); }
-  }, 1000);
-}
+// ─── Draw execution ────────────────────────────────────────────────────────
+function executeDraw(lobby) {
+  if (lobby.phase !== 'betting') return;
+  lobby.phase = 'reveal';
 
-function endRound() {
-  game.phase = 'reveal';
-  const positions = [];
-  game.positions.forEach((v, k) => positions.push({ position: k, bet: v.bet }));
-  broadcast({ type: 'round_end', roundId: game.roundId, secret: game.secret,
-              seed: game.seed, hash: game.hash, fund: game.fund, positions });
+  const winnerCount = HEX_COUNT / lobby.multiplier;   // 9 | 6 | 3
+  const loserCount  = HEX_COUNT - winnerCount;
+  const winners     = lobby.winningNumbers.slice(0, winnerCount);
+  const perWinner   = lobby.betSize + Math.floor(loserCount * (lobby.betSize - 1) / winnerCount);
+  const fundGain    = loserCount;  // 1 coin per loser to lottery fund
+
+  console.log(`[DRAW] lobby=${lobby.key} winners=[${winners}] perWinner=${perWinner} fund+=${fundGain}`);
+
+  broadcastToLobby(lobby.key, {
+    type:           'round_result',
+    lobbyKey:       lobby.key,
+    roundId:        lobby.roundId,
+    winningNumbers: lobby.winningNumbers,   // all 9 (for transparency)
+    winners,                                // first N (per multiplier)
+    seed:           lobby.seed,
+    hash:           lobby.hash,
+    betSize:        lobby.betSize,
+    multiplier:     lobby.multiplier,
+    perWinner,
+    fundGain,
+    positions:      lobbyPositionsArr(lobby),
+  });
+
+  // Reset lobby after reveal pause
   setTimeout(() => {
-    game = makeRound();
-    broadcast({ type: 'round_start', roundId: game.roundId, hash: game.hash, timer: game.timer });
-    startTick();
-  }, REVEAL_PAUSE * 1000);
+    const newLobby = makeLobby(lobby.betSize, lobby.multiplier);
+    lobbies.set(lobby.key, newLobby);
+    broadcastToLobby(lobby.key, {
+      type:     'new_round',
+      lobbyKey: lobby.key,
+      roundId:  newLobby.roundId,
+      hash:     newLobby.hash,
+    });
+    console.log(`[NEW ROUND] lobby=${lobby.key} roundId=${newLobby.roundId}`);
+  }, REVEAL_PAUSE);
 }
 
+// ─── Connection handler ────────────────────────────────────────────────────
 wss.on('connection', ws => {
-  ws.cid = ++connId;
-  console.log(`[WS] conn ${ws.cid} connected, total=${wss.clients.size}`);
+  ws.cid      = ++connIdSeq;
+  ws.lobbyKey = null;
 
-  const positions = [];
-  game.positions.forEach((v, k) => positions.push({ position: k, bet: v.bet }));
-  send(ws, { type: 'game_state', roundId: game.roundId, hash: game.hash,
-             timer: game.timer, phase: game.phase, fund: game.fund,
-             playerCount: game.positions.size, positions });
+  const ping = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  }, 5000);
 
   ws.on('message', raw => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
+    // ── join_lobby ──────────────────────────────────────────────────────────
+    if (msg.type === 'join_lobby') {
+      const betSize    = Number(msg.betSize);
+      const multiplier = Number(msg.multiplier);
+
+      if (!BET_SIZES.includes(betSize) || !MULTIPLIERS.includes(multiplier)) {
+        send(ws, { type: 'error', reason: 'Недопустимые параметры лобби' });
+        return;
+      }
+
+      ws.lobbyKey = getLobbyKey(betSize, multiplier);
+      const lobby = getOrCreateLobby(betSize, multiplier);
+
+      send(ws, {
+        type:        'lobby_state',
+        lobbyKey:    lobby.key,
+        betSize:     lobby.betSize,
+        multiplier:  lobby.multiplier,
+        hash:        lobby.hash,
+        phase:       lobby.phase,
+        positions:   lobbyPositionsArr(lobby),
+        playerCount: lobby.positions.size,
+        totalSlots:  HEX_COUNT,
+      });
+
+      console.log(`[JOIN] conn=${ws.cid} lobby=${ws.lobbyKey} (${lobby.positions.size}/${HEX_COUNT})`);
+      return;
+    }
+
+    // ── place_bet ───────────────────────────────────────────────────────────
     if (msg.type === 'place_bet') {
-      const pos = Number(msg.position);
-      const bet = Number(msg.bet);
+      const { lobbyKey } = msg;
+      const hexNum = Number(msg.hexNum);
 
-      if (game.phase !== 'betting') { send(ws, { type: 'bet_rejected', reason: 'Раунд уже завершён' }); return; }
-      if (!Number.isInteger(pos) || pos < 0 || pos >= TOTAL) { send(ws, { type: 'bet_rejected', reason: 'Недопустимая позиция' }); return; }
-      if (game.positions.has(pos)) { send(ws, { type: 'bet_rejected', reason: 'Позиция уже занята' }); return; }
-      if (!Number.isFinite(bet) || bet < 1 || bet > 10000) { send(ws, { type: 'bet_rejected', reason: 'Недопустимый размер ставки (1–10000)' }); return; }
+      if (!lobbyKey || !lobbies.has(lobbyKey)) {
+        send(ws, { type: 'bet_rejected', reason: 'Лобби не найдено' });
+        return;
+      }
+      const lobby = lobbies.get(lobbyKey);
 
+      if (lobby.phase !== 'betting') {
+        send(ws, { type: 'bet_rejected', lobbyKey, reason: 'Раунд уже завершён' });
+        return;
+      }
+      if (!Number.isInteger(hexNum) || hexNum < 1 || hexNum > HEX_COUNT) {
+        send(ws, { type: 'bet_rejected', lobbyKey, reason: 'Недопустимый номер хекса' });
+        return;
+      }
+      if (lobby.positions.has(hexNum)) {
+        send(ws, { type: 'bet_rejected', lobbyKey, reason: 'Хекс уже занят' });
+        return;
+      }
       let alreadyBet = false;
-      game.positions.forEach(v => { if (v.connId === ws.cid) alreadyBet = true; });
-      if (alreadyBet) { send(ws, { type: 'bet_rejected', reason: 'Вы уже сделали ставку в этом раунде' }); return; }
+      lobby.positions.forEach(v => { if (v.connId === ws.cid) alreadyBet = true; });
+      if (alreadyBet) {
+        send(ws, { type: 'bet_rejected', lobbyKey, reason: 'Вы уже сделали ставку' });
+        return;
+      }
 
-      game.positions.set(pos, { bet, connId: ws.cid });
-      game.fund += bet;
-      console.log(`[BET] conn=${ws.cid} pos=${pos} clients=${wss.clients.size}`);
-      broadcast({ type: 'bet_placed', position: pos, bet,
-                  playerCount: game.positions.size, fund: game.fund });
+      lobby.positions.set(hexNum, { connId: ws.cid });
+      console.log(`[BET] conn=${ws.cid} lobby=${lobbyKey} hex=${hexNum} (${lobby.positions.size}/${HEX_COUNT})`);
+
+      broadcastToLobby(lobbyKey, {
+        type:        'bet_placed',
+        lobbyKey,
+        hexNum,
+        playerCount: lobby.positions.size,
+        totalSlots:  HEX_COUNT,
+      });
+
+      if (lobby.positions.size === HEX_COUNT) executeDraw(lobby);
+      return;
     }
   });
 
-  ws.on('close', (code) => console.log(`[WS] conn ${ws.cid} disconnected code=${code}`));
-  ws.on('error', err => console.error(`[WS] conn ${ws.cid} error:`, err.message));
+  ws.on('close', () => {
+    clearInterval(ping);
+    console.log(`[WS] conn ${ws.cid} disconnected`);
+  });
+  ws.on('error', err => console.error(`[WS] conn ${ws.cid}:`, err.message));
 });
 
+// ─── Start ─────────────────────────────────────────────────────────────────
 httpServer.listen(PORT, () => {
-  console.log(`Candor server started on port ${PORT}`);
-  startTick();
+  console.log(`─────────────────────────────────────────────`);
+  console.log(`  Condor Lottery  →  http://localhost:${PORT}`);
+  console.log(`  WebSocket       →  ws://localhost:${PORT}`);
+  console.log(`  Lobbies: ${BET_SIZES.length} bet sizes × ${MULTIPLIERS.length} multipliers = ${BET_SIZES.length * MULTIPLIERS.length}`);
+  console.log(`─────────────────────────────────────────────`);
 });
