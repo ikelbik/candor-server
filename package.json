@@ -1,9 +1,9 @@
 {
   "name": "condor-lottery",
   "version": "1.0.0",
-  "main": "condor_server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node condor_server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "ws": "^8.19.0"
