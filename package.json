@@ -1,11 +1,37 @@
 {
-  "name": "candor-server",
+  "name": "hexdrop-ton-withdrawal",
   "version": "1.0.0",
-  "main": "server.js",
+  "description": "Telegram Stars to TON withdrawal system for HexDrop game",
+  "main": "api/ton_transfer.js",
   "scripts": {
-    "start": "node server.js"
+    "install": "npm install tonweb",
+    "test-transfer": "node api/ton_transfer.js '{\"to\":\"EQtest\",\"amount\":0.01,\"comment\":\"test\"}'",
+    "process-withdrawals": "php api/process_withdrawals.php",
+    "setup-db": "php api/setup_database.php",
+    "check-balance": "php api/check_balance.php"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "@ton/core": "^0.63.1",
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton": "^16.2.2",
+    "tonweb": "^0.0.66",
+    "tonweb-mnemonic": "^1.0.1",
+    "ws": "^8.19.0"
+  },
+  "keywords": [
+    "telegram",
+    "stars",
+    "ton",
+    "blockchain",
+    "withdrawal"
+  ],
+  "author": "HexDrop Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@dedust/sdk": "^0.8.7",
+    "esbuild": "^0.27.3"
   }
 }
