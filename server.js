@@ -65,7 +65,7 @@ function makeLobby(betSize, multiplier) {
     sig,              // HMAC signature — proves hash came from this server
     positions: new Map(), // hexNum (1-19) → { connId, isBot }
     phase:   'betting',   // 'betting' | 'reveal'
-    roundId: crypto.randomBytes(4).toString('hex'),
+    roundId: crypto.randomBytes(8).toString('hex'),
     timer:   ROUND_DURATION,
   };
 }
