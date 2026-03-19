@@ -7,6 +7,7 @@ const fs        = require('fs');
 const path      = require('path');
 
 const PORT           = process.env.PORT || 3001;
+const ROUND_SECRET   = process.env.CONDOR_ROUND_SECRET || '';
 const HEX_COUNT      = 19;    // positions per lobby
 const ROUND_DURATION = 60;    // seconds of betting phase
 const REVEAL_PAUSE   = 8000;  // ms before new round starts
@@ -46,8 +47,13 @@ function generateWinningNumbers() {
 function makeLobby(betSize, multiplier) {
   const seed           = crypto.randomBytes(16).toString('hex');
   const winningNumbers = generateWinningNumbers();  // always 9
+  // Sort numbers for hash so PHP can verify without caring about order
+  const sortedNums     = [...winningNumbers].sort((a, b) => a - b);
   const hash           = crypto.createHash('sha256')
-    .update(`${seed}:${winningNumbers.join(',')}`)
+    .update(`${seed}:${sortedNums.join(',')}`)
+    .digest('hex');
+  const sig            = crypto.createHmac('sha256', ROUND_SECRET)
+    .update(hash)
     .digest('hex');
   return {
     key: getLobbyKey(betSize, multiplier),
@@ -56,6 +62,7 @@ function makeLobby(betSize, multiplier) {
     seed,
     winningNumbers,   // hidden until reveal
     hash,             // committed to clients at round start
+    sig,              // HMAC signature — proves hash came from this server
     positions: new Map(), // hexNum (1-19) → { connId, isBot }
     phase:   'betting',   // 'betting' | 'reveal'
     roundId: crypto.randomBytes(4).toString('hex'),
@@ -139,10 +146,11 @@ function executeDraw(lobby) {
     type:           'round_result',
     lobbyKey:       lobby.key,
     roundId:        lobby.roundId,
-    winningNumbers: lobby.winningNumbers,   // all 9 (for transparency)
+    winningNumbers: lobby.winningNumbers,   // all 9 (for transparency + PHP verification)
     winners,                                // first N (per multiplier)
-    seed:           lobby.seed,
+    seed:           lobby.seed,             // revealed so PHP can verify SHA256(seed:sortedNums)==hash
     hash:           lobby.hash,
+    sig:            lobby.sig,
     betSize:        lobby.betSize,
     multiplier:     lobby.multiplier,
     perWinner,
@@ -159,6 +167,7 @@ function executeDraw(lobby) {
       lobbyKey: lobby.key,
       roundId:  newLobby.roundId,
       hash:     newLobby.hash,
+      sig:      newLobby.sig,
       timer:    newLobby.timer,
     });
     console.log(`[NEW ROUND] lobby=${lobby.key} roundId=${newLobby.roundId}`);
@@ -194,9 +203,11 @@ wss.on('connection', ws => {
       send(ws, {
         type:        'lobby_state',
         lobbyKey:    lobby.key,
+        roundId:     lobby.roundId,
         betSize:     lobby.betSize,
         multiplier:  lobby.multiplier,
         hash:        lobby.hash,
+        sig:         lobby.sig,
         phase:       lobby.phase,
         timer:       lobby.timer,
         positions:   lobbyPositionsArr(lobby),
@@ -260,5 +271,6 @@ httpServer.listen(PORT, () => {
   console.log(`  Condor Lottery  →  http://localhost:${PORT}`);
   console.log(`  WebSocket       →  ws://localhost:${PORT}`);
   console.log(`  Lobbies: ${BET_SIZES.length} bet sizes × ${MULTIPLIERS.length} multipliers = ${BET_SIZES.length * MULTIPLIERS.length}`);
+  if (!ROUND_SECRET) console.warn(`  ⚠ CONDOR_ROUND_SECRET not set — bet signatures are insecure!`);
   console.log(`─────────────────────────────────────────────`);
 });
