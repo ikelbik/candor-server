@@ -18,12 +18,12 @@ const MULTIPLIERS = [2, 3, 6];
 const WINNER_COUNTS = { 2: 9, 3: 6, 6: 3 };
 
 // ─── Math
-// Multiplier 2 →  9 winners, 10 losers  (19 total)
-// Multiplier 3 →  6 winners, 13 losers  (19 total)
-// Multiplier 6 →  3 winners, 16 losers  (19 total)
-// Each loser contributes betSize coins:
-//   1 coin goes to lottery fund, rest split equally among winners.
-//   perWinner = betSize + floor(loserCount * (betSize - 1) / winnerCount)
+// 19 positions total. 1 position's full bet → lottery fund (handled later).
+// Remaining 18 positions are distributed: winnerCount get paid, rest are losers.
+// Multiplier 2 → 9 winners,  9 losers from 18  → perWinner = betSize + floor(9  * betSize / 9)  = 2×
+// Multiplier 3 → 6 winners, 12 losers from 18  → perWinner = betSize + floor(12 * betSize / 6)  = 3×
+// Multiplier 6 → 3 winners, 15 losers from 18  → perWinner = betSize + floor(15 * betSize / 3)  = 6×
+const DISTRIB_COUNT = 18; // positions whose bets are distributed (1 goes to fund)
 
 // ─── Lobby state ───────────────────────────────────────────────────────────
 // key = "100x3"  →  lobby object
@@ -128,10 +128,10 @@ function executeDraw(lobby) {
   lobby.phase = 'reveal';
 
   const winnerCount = WINNER_COUNTS[lobby.multiplier];  // 9 | 6 | 3
-  const loserCount  = HEX_COUNT - winnerCount;
+  const loserCount  = DISTRIB_COUNT - winnerCount;
   const winners     = lobby.winningNumbers.slice(0, winnerCount);
-  const perWinner   = lobby.betSize + Math.floor(loserCount * (lobby.betSize - 1) / winnerCount);
-  const fundGain    = loserCount;  // 1 coin per loser to lottery fund
+  const perWinner   = lobby.betSize + Math.floor(loserCount * lobby.betSize / winnerCount);
+  const fundGain    = lobby.betSize;  // 1 full position's bet to lottery fund
 
   console.log(`[DRAW] lobby=${lobby.key} winners=[${winners}] perWinner=${perWinner} fund+=${fundGain}`);
 
