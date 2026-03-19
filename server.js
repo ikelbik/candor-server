@@ -7,17 +7,20 @@ const fs        = require('fs');
 const path      = require('path');
 
 const PORT           = process.env.PORT || 3001;
-const HEX_COUNT      = 18;    // positions per lobby
+const HEX_COUNT      = 19;    // positions per lobby
 const ROUND_DURATION = 60;    // seconds of betting phase
 const REVEAL_PAUSE   = 8000;  // ms before new round starts
 
-const BET_SIZES  = [10, 50, 100, 500, 1000];
+const BET_SIZES   = [10, 50, 100, 500, 1000];
 const MULTIPLIERS = [2, 3, 6];
 
+// Winner counts per multiplier (fixed, since 19 is not divisible evenly)
+const WINNER_COUNTS = { 2: 9, 3: 6, 6: 3 };
+
 // ─── Math
-// Multiplier 2 → 9 winners,  9 losers  (18 total)
-// Multiplier 3 → 6 winners, 12 losers  (18 total)
-// Multiplier 6 → 3 winners, 15 losers  (18 total)
+// Multiplier 2 →  9 winners, 10 losers  (19 total)
+// Multiplier 3 →  6 winners, 13 losers  (19 total)
+// Multiplier 6 →  3 winners, 16 losers  (19 total)
 // Each loser contributes betSize coins:
 //   1 coin goes to lottery fund, rest split equally among winners.
 //   perWinner = betSize + floor(loserCount * (betSize - 1) / winnerCount)
@@ -53,7 +56,7 @@ function makeLobby(betSize, multiplier) {
     seed,
     winningNumbers,   // hidden until reveal
     hash,             // committed to clients at round start
-    positions: new Map(), // hexNum (1-18) → { connId, isBot }
+    positions: new Map(), // hexNum (1-19) → { connId, isBot }
     phase:   'betting',   // 'betting' | 'reveal'
     roundId: crypto.randomBytes(4).toString('hex'),
     timer:   ROUND_DURATION,
@@ -124,7 +127,7 @@ function executeDraw(lobby) {
   if (lobby.phase !== 'betting') return;
   lobby.phase = 'reveal';
 
-  const winnerCount = HEX_COUNT / lobby.multiplier;   // 9 | 6 | 3
+  const winnerCount = WINNER_COUNTS[lobby.multiplier];  // 9 | 6 | 3
   const loserCount  = HEX_COUNT - winnerCount;
   const winners     = lobby.winningNumbers.slice(0, winnerCount);
   const perWinner   = lobby.betSize + Math.floor(loserCount * (lobby.betSize - 1) / winnerCount);
@@ -217,24 +220,17 @@ wss.on('connection', ws => {
       const lobby = lobbies.get(lobbyKey);
 
       if (lobby.phase !== 'betting') {
-        send(ws, { type: 'bet_rejected', lobbyKey, reason: 'Раунд уже завершён' });
+        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Раунд уже завершён' });
         return;
       }
       if (!Number.isInteger(hexNum) || hexNum < 1 || hexNum > HEX_COUNT) {
-        send(ws, { type: 'bet_rejected', lobbyKey, reason: 'Недопустимый номер хекса' });
+        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Недопустимый номер хекса' });
         return;
       }
       if (lobby.positions.has(hexNum)) {
-        send(ws, { type: 'bet_rejected', lobbyKey, reason: 'Хекс уже занят' });
+        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Хекс уже занят' });
         return;
       }
-      let alreadyBet = false;
-      lobby.positions.forEach(v => { if (v.connId === ws.cid) alreadyBet = true; });
-      if (alreadyBet) {
-        send(ws, { type: 'bet_rejected', lobbyKey, reason: 'Вы уже сделали ставку' });
-        return;
-      }
-
       lobby.positions.set(hexNum, { connId: ws.cid });
       console.log(`[BET] conn=${ws.cid} lobby=${lobbyKey} hex=${hexNum} (${lobby.positions.size}/${HEX_COUNT})`);
 
