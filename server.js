@@ -8,23 +8,22 @@ const path      = require('path');
 
 const PORT           = process.env.PORT || 3001;
 const ROUND_SECRET   = process.env.CONDOR_ROUND_SECRET || '';
-const HEX_COUNT      = 19;    // positions per lobby
+const HEX_COUNT      = 18;    // positions per lobby
 const ROUND_DURATION = 60;    // seconds of betting phase
 const REVEAL_PAUSE   = 8000;  // ms before new round starts
 
 const BET_SIZES   = [10, 50, 100, 500, 1000];
 const MULTIPLIERS = [2, 3, 6];
 
-// Winner counts per multiplier (fixed, since 19 is not divisible evenly)
+// Winner counts per multiplier for the 18 playable hexes.
 const WINNER_COUNTS = { 2: 9, 3: 6, 6: 3 };
 
 // ─── Math
-// 19 positions total. 1 position's full bet → lottery fund (handled later).
-// Remaining 18 positions are distributed: winnerCount get paid, rest are losers.
+// All 18 positions are playable and distributed between winners and losers.
 // Multiplier 2 → 9 winners,  9 losers from 18  → perWinner = betSize + floor(9  * betSize / 9)  = 2×
 // Multiplier 3 → 6 winners, 12 losers from 18  → perWinner = betSize + floor(12 * betSize / 6)  = 3×
 // Multiplier 6 → 3 winners, 15 losers from 18  → perWinner = betSize + floor(15 * betSize / 3)  = 6×
-const DISTRIB_COUNT = 18; // positions whose bets are distributed (1 goes to fund)
+const DISTRIB_COUNT = 18;
 
 // ─── Lobby state ───────────────────────────────────────────────────────────
 // key = "100x3"  →  lobby object
@@ -63,7 +62,7 @@ function makeLobby(betSize, multiplier) {
     winningNumbers,   // hidden until reveal
     hash,             // committed to clients at round start
     sig,              // HMAC signature — proves hash came from this server
-    positions: new Map(), // hexNum (1-19) → { connId, isBot }
+    positions: new Map(), // hexNum (1-18) → { connId, isBot }
     phase:   'betting',   // 'betting' | 'reveal'
     roundId: crypto.randomBytes(8).toString('hex'),
     timer:   ROUND_DURATION,
@@ -138,7 +137,7 @@ function executeDraw(lobby) {
   const loserCount  = DISTRIB_COUNT - winnerCount;
   const winners     = lobby.winningNumbers.slice(0, winnerCount);
   const perWinner   = lobby.betSize + Math.floor(loserCount * lobby.betSize / winnerCount);
-  const fundGain    = lobby.betSize;  // 1 full position's bet to lottery fund
+  const fundGain    = 0;
 
   console.log(`[DRAW] lobby=${lobby.key} winners=[${winners}] perWinner=${perWinner} fund+=${fundGain}`);
 
