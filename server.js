@@ -83,6 +83,21 @@ function lobbyPositionsArr(lobby) {
   return arr;
 }
 
+function getPlayerKey(ws, rawPlayerId = null) {
+  const cleaned = String(rawPlayerId ?? ws.playerId ?? '').replace(/\D+/g, '');
+  return cleaned ? `tg:${cleaned}` : `conn:${ws.cid}`;
+}
+
+function countHumanPlayers(lobby) {
+  const uniquePlayers = new Set();
+  lobby.positions.forEach(v => {
+    if (v?.isBot) return;
+    const playerKey = typeof v?.playerKey === 'string' ? v.playerKey : '';
+    if (playerKey) uniquePlayers.add(playerKey);
+  });
+  return uniquePlayers.size;
+}
+
 // ─── Bot fill + draw ───────────────────────────────────────────────────────
 function fillBotsAndDraw(lobby) {
   if (lobby.phase !== 'betting') return;
@@ -177,6 +192,7 @@ function executeDraw(lobby) {
 wss.on('connection', ws => {
   ws.cid      = ++connIdSeq;
   ws.lobbyKey = null;
+  ws.playerId = '';
 
   const ping = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) ws.ping();
@@ -190,6 +206,7 @@ wss.on('connection', ws => {
     if (msg.type === 'join_lobby') {
       const betSize    = Number(msg.betSize);
       const multiplier = Number(msg.multiplier);
+      ws.playerId = String(msg.playerId ?? '').replace(/\D+/g, '');
 
       if (!BET_SIZES.includes(betSize) || !MULTIPLIERS.includes(multiplier)) {
         send(ws, { type: 'error', reason: 'Недопустимые параметры лобби' });
@@ -210,11 +227,11 @@ wss.on('connection', ws => {
         phase:       lobby.phase,
         timer:       lobby.timer,
         positions:   lobbyPositionsArr(lobby),
-        playerCount: lobby.positions.size,
+        playerCount: countHumanPlayers(lobby),
         totalSlots:  HEX_COUNT,
       });
 
-      console.log(`[JOIN] conn=${ws.cid} lobby=${ws.lobbyKey} (${lobby.positions.size}/${HEX_COUNT})`);
+      console.log(`[JOIN] conn=${ws.cid} lobby=${ws.lobbyKey} players=${countHumanPlayers(lobby)} hexes=${lobby.positions.size}/${HEX_COUNT}`);
       return;
     }
 
@@ -222,6 +239,7 @@ wss.on('connection', ws => {
     if (msg.type === 'place_bet') {
       const { lobbyKey } = msg;
       const hexNum = Number(msg.hexNum);
+      const playerKey = getPlayerKey(ws, msg.playerId);
 
       if (!lobbyKey || !lobbies.has(lobbyKey)) {
         send(ws, { type: 'bet_rejected', reason: 'Лобби не найдено' });
@@ -241,14 +259,14 @@ wss.on('connection', ws => {
         send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Хекс уже занят' });
         return;
       }
-      lobby.positions.set(hexNum, { connId: ws.cid });
-      console.log(`[BET] conn=${ws.cid} lobby=${lobbyKey} hex=${hexNum} (${lobby.positions.size}/${HEX_COUNT})`);
+      lobby.positions.set(hexNum, { connId: ws.cid, playerKey });
+      console.log(`[BET] conn=${ws.cid} lobby=${lobbyKey} hex=${hexNum} players=${countHumanPlayers(lobby)} hexes=${lobby.positions.size}/${HEX_COUNT}`);
 
       broadcastToLobby(lobbyKey, {
         type:        'bet_placed',
         lobbyKey,
         hexNum,
-        playerCount: lobby.positions.size,
+        playerCount: countHumanPlayers(lobby),
         totalSlots:  HEX_COUNT,
       });
 
