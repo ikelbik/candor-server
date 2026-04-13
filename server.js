@@ -88,6 +88,49 @@ function getPlayerKey(ws, rawPlayerId = null) {
   return cleaned ? `tg:${cleaned}` : `conn:${ws.cid}`;
 }
 
+function base64UrlDecode(input) {
+  const normalized = String(input || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padding = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
+  return Buffer.from(normalized + padding, 'base64').toString('utf8');
+}
+
+function verifyBetTicket(token, lobby, hexNum) {
+  if (!ROUND_SECRET || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  const payloadB64 = parts[0];
+  const providedSig = parts[1];
+  const expectedSig = crypto.createHmac('sha256', ROUND_SECRET)
+    .update(payloadB64)
+    .digest('hex');
+  if (providedSig.length !== expectedSig.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(providedSig, 'utf8'), Buffer.from(expectedSig, 'utf8'))) {
+    return null;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(base64UrlDecode(payloadB64));
+  } catch {
+    return null;
+  }
+
+  const tid = String(payload?.tid ?? '').replace(/\D+/g, '');
+  const rid = String(payload?.rid ?? '');
+  const lk = String(payload?.lk ?? '');
+  const ticketHex = Number(payload?.hex);
+  const exp = Number(payload?.exp ?? 0);
+  const version = Number(payload?.v ?? 0);
+  const now = Math.floor(Date.now() / 1000);
+
+  if (!tid || version !== 1) return null;
+  if (rid !== lobby.roundId || lk !== lobby.key) return null;
+  if (!Number.isInteger(ticketHex) || ticketHex !== hexNum) return null;
+  if (!Number.isFinite(exp) || exp < now) return null;
+
+  return { telegramId: tid, playerKey: `tg:${tid}` };
+}
+
 function countHumanPlayers(lobby) {
   const uniquePlayers = new Set();
   lobby.positions.forEach(v => {
@@ -239,7 +282,6 @@ wss.on('connection', ws => {
     if (msg.type === 'place_bet') {
       const { lobbyKey } = msg;
       const hexNum = Number(msg.hexNum);
-      const playerKey = getPlayerKey(ws, msg.playerId);
 
       if (!lobbyKey || !lobbies.has(lobbyKey)) {
         send(ws, { type: 'bet_rejected', reason: 'Лобби не найдено' });
@@ -255,11 +297,21 @@ wss.on('connection', ws => {
         send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Недопустимый номер хекса' });
         return;
       }
+      if (!ROUND_SECRET) {
+        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Сервер ставок не настроен' });
+        return;
+      }
+      const verifiedTicket = verifyBetTicket(msg.ticket, lobby, hexNum);
+      if (!verifiedTicket) {
+        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Ставка не подтверждена' });
+        return;
+      }
       if (lobby.positions.has(hexNum)) {
         send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Хекс уже занят' });
         return;
       }
-      lobby.positions.set(hexNum, { connId: ws.cid, playerKey });
+      ws.playerId = verifiedTicket.telegramId;
+      lobby.positions.set(hexNum, { connId: ws.cid, playerKey: verifiedTicket.playerKey });
       console.log(`[BET] conn=${ws.cid} lobby=${lobbyKey} hex=${hexNum} players=${countHumanPlayers(lobby)} hexes=${lobby.positions.size}/${HEX_COUNT}`);
 
       broadcastToLobby(lobbyKey, {
