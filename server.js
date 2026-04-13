@@ -7,7 +7,6 @@ const fs        = require('fs');
 const path      = require('path');
 
 const PORT           = process.env.PORT || 3001;
-const ROUND_SECRET   = process.env.CONDOR_ROUND_SECRET || '';
 const HEX_COUNT      = 18;    // positions per lobby
 const ROUND_DURATION = 60;    // seconds of betting phase
 const REVEAL_PAUSE   = 8000;  // ms before new round starts
@@ -17,6 +16,31 @@ const MULTIPLIERS = [2, 3, 6];
 
 // Winner counts per multiplier for the 18 playable hexes.
 const WINNER_COUNTS = { 2: 9, 3: 6, 6: 3 };
+
+function loadRoundSecretFromPhpConfig() {
+  const candidates = [
+    path.resolve(__dirname, '..', '..', '..', 'config_candor.php'),
+    path.resolve(__dirname, '..', '..', '..', '..', 'config_candor.php'),
+    path.resolve(__dirname, 'config_candor.php'),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) continue;
+      const raw = fs.readFileSync(candidate, 'utf8');
+      const match = raw.match(/define\s*\(\s*['"]CONDOR_ROUND_SECRET['"]\s*,\s*['"]([^'"]+)['"]\s*\)/i);
+      if (match && match[1]) {
+        return match[1];
+      }
+    } catch {}
+  }
+  return '';
+}
+
+const ROUND_SECRET = process.env.CONDOR_ROUND_SECRET || loadRoundSecretFromPhpConfig();
+if (!ROUND_SECRET) {
+  throw new Error('CONDOR_ROUND_SECRET is required. Refusing to start with an empty round secret.');
+}
 
 // ─── Math
 // All 18 positions are playable and distributed between winners and losers.
@@ -95,24 +119,33 @@ function base64UrlDecode(input) {
 }
 
 function verifyBetTicket(token, lobby, hexNum) {
-  if (!ROUND_SECRET || typeof token !== 'string') return null;
+  if (!ROUND_SECRET) {
+    return { ok: false, reason: 'server_secret_missing' };
+  }
+  if (typeof token !== 'string') {
+    return { ok: false, reason: 'ticket_missing' };
+  }
   const parts = token.split('.');
-  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return { ok: false, reason: 'ticket_format_invalid' };
+  }
   const payloadB64 = parts[0];
   const providedSig = parts[1];
   const expectedSig = crypto.createHmac('sha256', ROUND_SECRET)
     .update(payloadB64)
     .digest('hex');
-  if (providedSig.length !== expectedSig.length) return null;
+  if (providedSig.length !== expectedSig.length) {
+    return { ok: false, reason: 'ticket_signature_invalid' };
+  }
   if (!crypto.timingSafeEqual(Buffer.from(providedSig, 'utf8'), Buffer.from(expectedSig, 'utf8'))) {
-    return null;
+    return { ok: false, reason: 'ticket_signature_invalid' };
   }
 
   let payload;
   try {
     payload = JSON.parse(base64UrlDecode(payloadB64));
   } catch {
-    return null;
+    return { ok: false, reason: 'ticket_payload_invalid' };
   }
 
   const tid = String(payload?.tid ?? '').replace(/\D+/g, '');
@@ -123,12 +156,41 @@ function verifyBetTicket(token, lobby, hexNum) {
   const version = Number(payload?.v ?? 0);
   const now = Math.floor(Date.now() / 1000);
 
-  if (!tid || version !== 1) return null;
-  if (rid !== lobby.roundId || lk !== lobby.key) return null;
-  if (!Number.isInteger(ticketHex) || ticketHex !== hexNum) return null;
-  if (!Number.isFinite(exp) || exp < now) return null;
+  if (!tid) return { ok: false, reason: 'ticket_player_missing' };
+  if (version !== 1) return { ok: false, reason: 'ticket_version_invalid' };
+  if (rid !== lobby.roundId) {
+    return { ok: false, reason: 'ticket_round_mismatch', detail: { ticketRoundId: rid, lobbyRoundId: lobby.roundId } };
+  }
+  if (lk !== lobby.key) {
+    return { ok: false, reason: 'ticket_lobby_mismatch', detail: { ticketLobbyKey: lk, lobbyKey: lobby.key } };
+  }
+  if (!Number.isInteger(ticketHex) || ticketHex !== hexNum) {
+    return { ok: false, reason: 'ticket_hex_mismatch', detail: { ticketHex: ticketHex, requestedHex: hexNum } };
+  }
+  if (!Number.isFinite(exp) || exp < now) {
+    return { ok: false, reason: 'ticket_expired', detail: { exp, now } };
+  }
 
-  return { telegramId: tid, playerKey: `tg:${tid}` };
+  return { ok: true, telegramId: tid, playerKey: `tg:${tid}` };
+}
+
+function mapTicketRejectReason(result) {
+  switch (result?.reason) {
+    case 'server_secret_missing':
+      return 'Сервер ставок не настроен';
+    case 'ticket_round_mismatch':
+      return 'Раунд уже сменился';
+    case 'ticket_lobby_mismatch':
+      return 'Лобби ставки изменилось';
+    case 'ticket_hex_mismatch':
+      return 'Подпись выдана для другого хекса';
+    case 'ticket_expired':
+      return 'Подтверждение ставки истекло';
+    case 'ticket_signature_invalid':
+      return 'Подпись ставки не прошла проверку';
+    default:
+      return 'Ставка не подтверждена';
+  }
 }
 
 function countHumanPlayers(lobby) {
@@ -297,13 +359,15 @@ wss.on('connection', ws => {
         send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Недопустимый номер хекса' });
         return;
       }
-      if (!ROUND_SECRET) {
-        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Сервер ставок не настроен' });
-        return;
-      }
       const verifiedTicket = verifyBetTicket(msg.ticket, lobby, hexNum);
-      if (!verifiedTicket) {
-        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Ставка не подтверждена' });
+      if (!verifiedTicket?.ok) {
+        console.warn('[BET_REJECTED]', JSON.stringify({
+          lobbyKey,
+          hexNum,
+          reason: verifiedTicket?.reason || 'ticket_invalid',
+          detail: verifiedTicket?.detail || null,
+        }));
+        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: mapTicketRejectReason(verifiedTicket) });
         return;
       }
       if (lobby.positions.has(hexNum)) {
