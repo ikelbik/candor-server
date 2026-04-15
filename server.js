@@ -11,7 +11,7 @@ const HEX_COUNT      = 18;    // positions per lobby
 const ROUND_DURATION = 60;    // seconds of betting phase
 const REVEAL_PAUSE   = 8000;  // ms before new round starts
 
-const BET_SIZES   = [10, 50, 100, 500, 1000];
+const BET_SIZES   = [5, 10, 25, 50, 100];
 const MULTIPLIERS = [2, 3, 6];
 
 // Winner counts per multiplier for the 18 playable hexes.
