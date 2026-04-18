@@ -256,7 +256,10 @@ function send(ws, data) {
 function broadcastToLobby(key, data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN && c.lobbyKey === key) c.send(msg);
+    const subscribed = c.lobbyKeys instanceof Set
+      ? c.lobbyKeys.has(key)
+      : c.lobbyKey === key;
+    if (c.readyState === WebSocket.OPEN && subscribed) c.send(msg);
   });
 }
 
@@ -326,6 +329,7 @@ wss.on('connection', (ws, req) => {
 
   ws.cid      = ++connIdSeq;
   ws.lobbyKey = null;
+  ws.lobbyKeys = new Set();
   ws.playerId = '';
   ws._ip      = ip;
   ws._msgCount = 0;
@@ -368,6 +372,7 @@ wss.on('connection', (ws, req) => {
       }
 
       ws.lobbyKey = getLobbyKey(betSize, multiplier);
+      ws.lobbyKeys.add(ws.lobbyKey);
       const lobby = getOrCreateLobby(betSize, multiplier);
 
       send(ws, {
