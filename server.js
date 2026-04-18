@@ -57,11 +57,23 @@ function getLobbyKey(betSize, multiplier) {
   return `${betSize}x${multiplier}`;
 }
 
+function cryptoRandInt(max) {
+  // Rejection-sampling: ensures uniform distribution, no modulo bias
+  const needed = Math.ceil(Math.log2(max + 1));
+  const byteCount = Math.ceil(needed / 8);
+  const mask = (1 << needed) - 1;
+  let val;
+  do {
+    val = crypto.randomBytes(byteCount).readUIntBE(0, byteCount) & mask;
+  } while (val > max);
+  return val;
+}
+
 function generateWinningNumbers() {
-  // Shuffle 1..HEX_COUNT, take first 9
+  // Fisher-Yates shuffle with CSPRNG — crypto.randomBytes() only
   const arr = Array.from({ length: HEX_COUNT }, (_, i) => i + 1);
   for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = cryptoRandInt(i);
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr.slice(0, 9);
@@ -293,17 +305,54 @@ function executeDraw(lobby) {
   }, REVEAL_PAUSE);
 }
 
+// ─── Connection rate limiting ──────────────────────────────────────────────
+const MAX_CONNS_PER_IP  = 10;   // max simultaneous WS connections per IP
+const MAX_MSG_BYTES     = 4096; // max incoming message size
+const MSG_RATE_WINDOW   = 1000; // ms window for rate limiting messages
+const MSG_RATE_MAX      = 20;   // max messages per window per connection
+
+const connCountByIp = new Map(); // ip → count
+
 // ─── Connection handler ────────────────────────────────────────────────────
-wss.on('connection', ws => {
+wss.on('connection', (ws, req) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || '';
+
+  const currentCount = connCountByIp.get(ip) || 0;
+  if (currentCount >= MAX_CONNS_PER_IP) {
+    ws.close(1008, 'Too many connections');
+    return;
+  }
+  connCountByIp.set(ip, currentCount + 1);
+
   ws.cid      = ++connIdSeq;
   ws.lobbyKey = null;
   ws.playerId = '';
+  ws._ip      = ip;
+  ws._msgCount = 0;
+  ws._msgWindowStart = Date.now();
 
   const ping = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) ws.ping();
   }, 5000);
 
   ws.on('message', raw => {
+    // Size guard
+    if (Buffer.byteLength(raw) > MAX_MSG_BYTES) {
+      ws.close(1009, 'Message too large');
+      return;
+    }
+    // Rate limit guard
+    const now = Date.now();
+    if (now - ws._msgWindowStart > MSG_RATE_WINDOW) {
+      ws._msgWindowStart = now;
+      ws._msgCount = 0;
+    }
+    ws._msgCount++;
+    if (ws._msgCount > MSG_RATE_MAX) {
+      ws.close(1008, 'Rate limit exceeded');
+      return;
+    }
+
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
@@ -393,6 +442,9 @@ wss.on('connection', ws => {
 
   ws.on('close', () => {
     clearInterval(ping);
+    const remaining = (connCountByIp.get(ws._ip) || 1) - 1;
+    if (remaining <= 0) connCountByIp.delete(ws._ip);
+    else connCountByIp.set(ws._ip, remaining);
     console.log(`[WS] conn ${ws.cid} disconnected`);
   });
   ws.on('error', err => console.error(`[WS] conn ${ws.cid}:`, err.message));
