@@ -13,6 +13,7 @@ const REVEAL_PAUSE   = 8000;  // ms before new round starts
 
 const BET_SIZES   = [5, 10, 25, 50, 100];
 const MULTIPLIERS = [2, 3, 6];
+const INITIAL_LOBBY_STAGGER = BET_SIZES.length * MULTIPLIERS.length - 1; // 14s spread across 15 lobbies
 
 // Winner counts per multiplier for the 18 playable hexes.
 const WINNER_COUNTS = { 2: 9, 3: 6, 6: 3 };
@@ -79,7 +80,15 @@ function generateWinningNumbers() {
   return arr.slice(0, 9);
 }
 
-function makeLobby(betSize, multiplier) {
+function getInitialLobbyTimer(betSize, multiplier) {
+  const betIdx = BET_SIZES.indexOf(betSize);
+  const multIdx = MULTIPLIERS.indexOf(multiplier);
+  if (betIdx < 0 || multIdx < 0) return ROUND_DURATION;
+  const phaseOffset = betIdx * MULTIPLIERS.length + multIdx;
+  return Math.max(1, ROUND_DURATION - Math.min(phaseOffset, INITIAL_LOBBY_STAGGER));
+}
+
+function makeLobby(betSize, multiplier, timer = ROUND_DURATION) {
   const seed           = crypto.randomBytes(16).toString('hex');
   const winningNumbers = generateWinningNumbers();  // always 9
   // Sort numbers for hash so PHP can verify without caring about order
@@ -101,13 +110,15 @@ function makeLobby(betSize, multiplier) {
     positions: new Map(), // hexNum (1-18) → { connId, isBot }
     phase:   'betting',   // 'betting' | 'reveal'
     roundId: crypto.randomBytes(8).toString('hex'),
-    timer:   ROUND_DURATION,
+    timer,
   };
 }
 
 function getOrCreateLobby(betSize, multiplier) {
   const key = getLobbyKey(betSize, multiplier);
-  if (!lobbies.has(key)) lobbies.set(key, makeLobby(betSize, multiplier));
+  if (!lobbies.has(key)) {
+    lobbies.set(key, makeLobby(betSize, multiplier, getInitialLobbyTimer(betSize, multiplier)));
+  }
   return lobbies.get(key);
 }
 
