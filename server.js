@@ -13,7 +13,6 @@ const REVEAL_PAUSE   = 8000;  // ms before new round starts
 
 const BET_SIZES   = [5, 10, 25, 50, 100];
 const MULTIPLIERS = [2, 3, 6];
-const INITIAL_LOBBY_STAGGER = BET_SIZES.length * MULTIPLIERS.length - 1; // 14s spread across 15 lobbies
 
 // Winner counts per multiplier for the 18 playable hexes.
 const WINNER_COUNTS = { 2: 9, 3: 6, 6: 3 };
@@ -84,8 +83,13 @@ function getInitialLobbyTimer(betSize, multiplier) {
   const betIdx = BET_SIZES.indexOf(betSize);
   const multIdx = MULTIPLIERS.indexOf(multiplier);
   if (betIdx < 0 || multIdx < 0) return ROUND_DURATION;
-  const phaseOffset = betIdx * MULTIPLIERS.length + multIdx;
-  return Math.max(1, ROUND_DURATION - Math.min(phaseOffset, INITIAL_LOBBY_STAGGER));
+  // Fixed startup staggering:
+  // - each next bet-size group shifts by 10s
+  // - each next multiplier inside a bet-size group shifts by 10s
+  // This keeps lobbies deterministically desynchronised without changing round logic.
+  const phaseOffsetSec = (betIdx * 10) + (multIdx * 10);
+  const wrappedOffset = phaseOffsetSec % ROUND_DURATION;
+  return wrappedOffset === 0 ? ROUND_DURATION : (ROUND_DURATION - wrappedOffset);
 }
 
 function makeLobby(betSize, multiplier, timer = ROUND_DURATION) {
