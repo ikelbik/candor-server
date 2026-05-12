@@ -421,11 +421,11 @@ wss.on('connection', (ws, req) => {
       const lobby = lobbies.get(lobbyKey);
 
       if (lobby.phase !== 'betting') {
-        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Раунд уже завершён' });
+        send(ws, { type: 'bet_rejected', lobbyKey, roundId: lobby.roundId, hexNum, reason: 'Раунд уже завершён' });
         return;
       }
       if (!Number.isInteger(hexNum) || hexNum < 1 || hexNum > HEX_COUNT) {
-        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Недопустимый номер хекса' });
+        send(ws, { type: 'bet_rejected', lobbyKey, roundId: lobby.roundId, hexNum, reason: 'Недопустимый номер хекса' });
         return;
       }
       const verifiedTicket = verifyBetTicket(msg.ticket, lobby, hexNum);
@@ -436,11 +436,11 @@ wss.on('connection', (ws, req) => {
           reason: verifiedTicket?.reason || 'ticket_invalid',
           detail: verifiedTicket?.detail || null,
         }));
-        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: mapTicketRejectReason(verifiedTicket) });
+        send(ws, { type: 'bet_rejected', lobbyKey, roundId: lobby.roundId, hexNum, reason: mapTicketRejectReason(verifiedTicket) });
         return;
       }
       if (lobby.positions.has(hexNum)) {
-        send(ws, { type: 'bet_rejected', lobbyKey, hexNum, reason: 'Хекс уже занят' });
+        send(ws, { type: 'bet_rejected', lobbyKey, roundId: lobby.roundId, hexNum, reason: 'Хекс уже занят' });
         return;
       }
       ws.playerId = verifiedTicket.telegramId;
