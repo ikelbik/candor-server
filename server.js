@@ -102,8 +102,11 @@ function makeLobby(betSize, multiplier, timer = ROUND_DURATION) {
   const hash           = crypto.createHash('sha256')
     .update(`${seed}:${sortedNums.join(',')}`)
     .digest('hex');
+  // bettingDeadline: latest Unix timestamp at which lock_bet is still valid.
+  // timer + 60s buffer covers pendingAccepts delays and slow connections.
+  const bettingDeadline = Math.floor(Date.now() / 1000) + timer + 60;
   const sig            = crypto.createHmac('sha256', ROUND_SECRET)
-    .update(hash)
+    .update(`${hash}:${bettingDeadline}`)
     .digest('hex');
   return {
     key: getLobbyKey(betSize, multiplier),
@@ -112,7 +115,8 @@ function makeLobby(betSize, multiplier, timer = ROUND_DURATION) {
     seed,
     winningNumbers,   // hidden until reveal
     hash,             // committed to clients at round start
-    sig,              // HMAC signature — proves hash came from this server
+    sig,              // HMAC(hash:bettingDeadline) — proves hash + deadline from this server
+    bettingDeadline,  // Unix timestamp — PHP rejects lock_bet after this
     positions: new Map(), // hexNum (1-18) → { connId, isBot }
     pendingAccepts: 0,
     phase:   'betting',   // 'betting' | 'reveal'
@@ -389,12 +393,13 @@ function executeDraw(lobby) {
     const newLobby = makeLobby(lobby.betSize, lobby.multiplier);
     lobbies.set(lobby.key, newLobby);
     broadcastToLobby(lobby.key, {
-      type:     'new_round',
-      lobbyKey: lobby.key,
-      roundId:  newLobby.roundId,
-      hash:     newLobby.hash,
-      sig:      newLobby.sig,
-      timer:    newLobby.timer,
+      type:            'new_round',
+      lobbyKey:        lobby.key,
+      roundId:         newLobby.roundId,
+      hash:            newLobby.hash,
+      sig:             newLobby.sig,
+      bettingDeadline: newLobby.bettingDeadline,
+      timer:           newLobby.timer,
     });
     console.log(`[NEW ROUND] lobby=${lobby.key} roundId=${newLobby.roundId}`);
   }, REVEAL_PAUSE);
@@ -468,18 +473,19 @@ wss.on('connection', (ws, req) => {
       const lobby = getOrCreateLobby(betSize, multiplier);
 
       send(ws, {
-        type:        'lobby_state',
-        lobbyKey:    lobby.key,
-        roundId:     lobby.roundId,
-        betSize:     lobby.betSize,
-        multiplier:  lobby.multiplier,
-        hash:        lobby.hash,
-        sig:         lobby.sig,
-        phase:       lobby.phase,
-        timer:       lobby.timer,
-        positions:   lobbyPositionsArr(lobby),
-        playerCount: countHumanPlayers(lobby),
-        totalSlots:  HEX_COUNT,
+        type:            'lobby_state',
+        lobbyKey:        lobby.key,
+        roundId:         lobby.roundId,
+        betSize:         lobby.betSize,
+        multiplier:      lobby.multiplier,
+        hash:            lobby.hash,
+        sig:             lobby.sig,
+        bettingDeadline: lobby.bettingDeadline,
+        phase:           lobby.phase,
+        timer:           lobby.timer,
+        positions:       lobbyPositionsArr(lobby),
+        playerCount:     countHumanPlayers(lobby),
+        totalSlots:      HEX_COUNT,
       });
 
       console.log(`[JOIN] conn=${ws.cid} lobby=${ws.lobbyKey} players=${countHumanPlayers(lobby)} hexes=${lobby.positions.size}/${HEX_COUNT}`);
