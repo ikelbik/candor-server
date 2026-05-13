@@ -8,8 +8,17 @@ const path      = require('path');
 
 const PORT           = process.env.PORT || 3001;
 const PROFILE_API_URL = process.env.CONDOR_PROFILE_API_URL || '';
-const ACCEPT_SYNC_TIMEOUT_MS = 2500;
+const ACCEPT_SYNC_TIMEOUT_MS = 5000;
 const HEX_COUNT      = 18;    // positions per lobby
+
+// Serializes PHP accept calls per player to avoid concurrent FOR UPDATE contention
+const playerAcceptQueues = new Map(); // telegramId → last pending Promise
+function serializedPhpAccept(telegramId, fn) {
+  const prev = playerAcceptQueues.get(telegramId) ?? Promise.resolve();
+  const p = prev.then(fn, fn);
+  playerAcceptQueues.set(telegramId, p.then(() => {}, () => {}));
+  return p;
+}
 const ROUND_DURATION = 60;    // seconds of betting phase
 const REVEAL_PAUSE   = 8000;  // ms before new round starts
 
@@ -530,7 +539,10 @@ wss.on('connection', (ws, req) => {
       ws.playerId = verifiedTicket.telegramId;
       lobby.positions.set(hexNum, { connId: ws.cid, playerKey: verifiedTicket.playerKey, pending: true });
       lobby.pendingAccepts++;
-      const phpAccepted = await notifyPhpBetAccepted(lobby, hexNum, verifiedTicket.telegramId, acceptedSig);
+      const phpAccepted = await serializedPhpAccept(
+        verifiedTicket.telegramId,
+        () => notifyPhpBetAccepted(lobby, hexNum, verifiedTicket.telegramId, acceptedSig)
+      );
       lobby.pendingAccepts = Math.max(0, lobby.pendingAccepts - 1);
       if (!phpAccepted) {
         const current = lobby.positions.get(hexNum);
