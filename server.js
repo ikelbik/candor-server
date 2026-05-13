@@ -355,9 +355,13 @@ function executeDraw(lobby) {
 
   const winnerCount = WINNER_COUNTS[lobby.multiplier];  // 9 | 6 | 3
   const loserCount  = DISTRIB_COUNT - winnerCount;
-  // Sort before slice — must match PHP claimResult logic (hash commits to SET, not order)
-  const sortedWinning = [...lobby.winningNumbers].sort((a, b) => a - b);
-  const winners     = sortedWinning.slice(0, winnerCount);
+  // Fisher-Yates shuffle already randomised winningNumbers; take first N as winners.
+  // Sign the exact list so PHP can verify it without re-deriving via sort+slice,
+  // preventing both the sort-bias attack and the original reordering attack.
+  const winners     = lobby.winningNumbers.slice(0, winnerCount);
+  const winnersSig  = crypto.createHmac('sha256', ROUND_SECRET)
+    .update(`winners:${lobby.roundId}:${winners.join(',')}`)
+    .digest('hex');
   const perWinner   = lobby.betSize + Math.floor(loserCount * lobby.betSize / winnerCount);
   const fundGain    = 0;
 
@@ -369,6 +373,7 @@ function executeDraw(lobby) {
     roundId:        lobby.roundId,
     winningNumbers: lobby.winningNumbers,   // all 9 (for transparency + PHP verification)
     winners,                                // first N (per multiplier)
+    winnersSig,                             // HMAC proves server chose these winners
     seed:           lobby.seed,             // revealed so PHP can verify SHA256(seed:sortedNums)==hash
     hash:           lobby.hash,
     sig:            lobby.sig,
