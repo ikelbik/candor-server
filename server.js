@@ -7,6 +7,8 @@ const fs        = require('fs');
 const path      = require('path');
 
 const PORT           = process.env.PORT || 3001;
+const PROFILE_API_URL = process.env.CONDOR_PROFILE_API_URL || '';
+const ACCEPT_SYNC_TIMEOUT_MS = 2500;
 const HEX_COUNT      = 18;    // positions per lobby
 const ROUND_DURATION = 60;    // seconds of betting phase
 const REVEAL_PAUSE   = 8000;  // ms before new round starts
@@ -112,6 +114,7 @@ function makeLobby(betSize, multiplier, timer = ROUND_DURATION) {
     hash,             // committed to clients at round start
     sig,              // HMAC signature — proves hash came from this server
     positions: new Map(), // hexNum (1-18) → { connId, isBot }
+    pendingAccepts: 0,
     phase:   'betting',   // 'betting' | 'reveal'
     roundId: crypto.randomBytes(8).toString('hex'),
     timer,
@@ -128,15 +131,75 @@ function getOrCreateLobby(betSize, multiplier) {
 
 function lobbyPositionsArr(lobby) {
   const arr = [];
-  lobby.positions.forEach((v, hexNum) =>
-    arr.push({ hexNum, isBot: v.isBot || false })
-  );
+  lobby.positions.forEach((v, hexNum) => {
+    if (v?.pending) return;
+    arr.push({ hexNum, isBot: v.isBot || false });
+  });
   return arr;
 }
 
 function getPlayerKey(ws, rawPlayerId = null) {
   const cleaned = String(rawPlayerId ?? ws.playerId ?? '').replace(/\D+/g, '');
   return cleaned ? `tg:${cleaned}` : `conn:${ws.cid}`;
+}
+
+function makeBetAcceptedSig(lobby, hexNum, playerKey) {
+  return crypto.createHmac('sha256', ROUND_SECRET)
+    .update(`accepted:${lobby.roundId}:${lobby.key}:${hexNum}:${playerKey}`)
+    .digest('hex');
+}
+
+function makeServerAcceptSig(lobby, hexNum, telegramId, acceptedSig) {
+  return crypto.createHmac('sha256', ROUND_SECRET)
+    .update(`server_accept:${telegramId}:${lobby.roundId}:${lobby.key}:${hexNum}:${acceptedSig}`)
+    .digest('hex');
+}
+
+async function notifyPhpBetAccepted(lobby, hexNum, telegramId, acceptedSig, attempt = 1) {
+  if (!PROFILE_API_URL) {
+    console.warn('[PHP_ACCEPT] CONDOR_PROFILE_API_URL is not configured');
+    return false;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ACCEPT_SYNC_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${PROFILE_API_URL}?action=accept_bet_hex_server`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        telegram_id: telegramId,
+        round_id: lobby.roundId,
+        lobby_key: lobby.key,
+        hex_num: hexNum,
+        accepted_sig: acceptedSig,
+        server_sig: makeServerAcceptSig(lobby, hexNum, telegramId, acceptedSig),
+      }),
+    });
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (!res.ok) {
+      console.warn(`[PHP_ACCEPT] status=${res.status} lobby=${lobby.key} round=${lobby.roundId} hex=${hexNum}`);
+      return false;
+    }
+    if (!body?.success) {
+      console.warn(`[PHP_ACCEPT] failed error=${body?.error || 'unknown'} lobby=${lobby.key} round=${lobby.roundId} hex=${hexNum}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    // On timeout (AbortError): PHP may have accepted but the response was lost.
+    // Retry once after a short delay before giving up and freeing the position.
+    if (err?.name === 'AbortError' && attempt === 1) {
+      console.warn(`[PHP_ACCEPT] timeout on attempt 1, retrying — lobby=${lobby.key} hex=${hexNum}`);
+      await new Promise(r => setTimeout(r, 500));
+      return notifyPhpBetAccepted(lobby, hexNum, telegramId, acceptedSig, 2);
+    }
+    console.warn(`[PHP_ACCEPT] ${err?.message || err}`);
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function base64UrlDecode(input) {
@@ -178,6 +241,8 @@ function verifyBetTicket(token, lobby, hexNum) {
   const tid = String(payload?.tid ?? '').replace(/\D+/g, '');
   const rid = String(payload?.rid ?? '');
   const lk = String(payload?.lk ?? '');
+  const betSize = Number(payload?.bs);
+  const multiplier = Number(payload?.mul);
   const ticketHex = Number(payload?.hex);
   const exp = Number(payload?.exp ?? 0);
   const version = Number(payload?.v ?? 0);
@@ -190,6 +255,9 @@ function verifyBetTicket(token, lobby, hexNum) {
   }
   if (lk !== lobby.key) {
     return { ok: false, reason: 'ticket_lobby_mismatch', detail: { ticketLobbyKey: lk, lobbyKey: lobby.key } };
+  }
+  if (betSize !== lobby.betSize || multiplier !== lobby.multiplier) {
+    return { ok: false, reason: 'ticket_lobby_mismatch', detail: { ticketBetSize: betSize, lobbyBetSize: lobby.betSize, ticketMultiplier: multiplier, lobbyMultiplier: lobby.multiplier } };
   }
   if (!Number.isInteger(ticketHex) || ticketHex !== hexNum) {
     return { ok: false, reason: 'ticket_hex_mismatch', detail: { ticketHex: ticketHex, requestedHex: hexNum } };
@@ -233,6 +301,7 @@ function countHumanPlayers(lobby) {
 // ─── Bot fill + draw ───────────────────────────────────────────────────────
 function fillBotsAndDraw(lobby) {
   if (lobby.phase !== 'betting') return;
+  if (lobby.pendingAccepts > 0) return;
   for (let h = 1; h <= HEX_COUNT; h++) {
     if (!lobby.positions.has(h))
       lobby.positions.set(h, { connId: null, isBot: true });
@@ -281,11 +350,14 @@ function broadcastToLobby(key, data) {
 // ─── Draw execution ────────────────────────────────────────────────────────
 function executeDraw(lobby) {
   if (lobby.phase !== 'betting') return;
+  if (lobby.pendingAccepts > 0) return;
   lobby.phase = 'reveal';
 
   const winnerCount = WINNER_COUNTS[lobby.multiplier];  // 9 | 6 | 3
   const loserCount  = DISTRIB_COUNT - winnerCount;
-  const winners     = lobby.winningNumbers.slice(0, winnerCount);
+  // Sort before slice — must match PHP claimResult logic (hash commits to SET, not order)
+  const sortedWinning = [...lobby.winningNumbers].sort((a, b) => a - b);
+  const winners     = sortedWinning.slice(0, winnerCount);
   const perWinner   = lobby.betSize + Math.floor(loserCount * lobby.betSize / winnerCount);
   const fundGain    = 0;
 
@@ -354,7 +426,7 @@ wss.on('connection', (ws, req) => {
     if (ws.readyState === WebSocket.OPEN) ws.ping();
   }, 5000);
 
-  ws.on('message', raw => {
+  ws.on('message', async raw => {
     // Size guard
     if (Buffer.byteLength(raw) > MAX_MSG_BYTES) {
       ws.close(1009, 'Message too large');
@@ -443,14 +515,29 @@ wss.on('connection', (ws, req) => {
         send(ws, { type: 'bet_rejected', lobbyKey, roundId: lobby.roundId, hexNum, reason: 'Хекс уже занят' });
         return;
       }
+      const acceptedSig = makeBetAcceptedSig(lobby, hexNum, verifiedTicket.playerKey);
       ws.playerId = verifiedTicket.telegramId;
+      lobby.positions.set(hexNum, { connId: ws.cid, playerKey: verifiedTicket.playerKey, pending: true });
+      lobby.pendingAccepts++;
+      const phpAccepted = await notifyPhpBetAccepted(lobby, hexNum, verifiedTicket.telegramId, acceptedSig);
+      lobby.pendingAccepts = Math.max(0, lobby.pendingAccepts - 1);
+      if (!phpAccepted) {
+        const current = lobby.positions.get(hexNum);
+        if (current?.connId === ws.cid && current?.playerKey === verifiedTicket.playerKey) {
+          lobby.positions.delete(hexNum);
+        }
+        send(ws, { type: 'bet_rejected', lobbyKey, roundId: lobby.roundId, hexNum, reason: 'Сервер подтверждения ставки недоступен' });
+        return;
+      }
       lobby.positions.set(hexNum, { connId: ws.cid, playerKey: verifiedTicket.playerKey });
       console.log(`[BET] conn=${ws.cid} lobby=${lobbyKey} hex=${hexNum} players=${countHumanPlayers(lobby)} hexes=${lobby.positions.size}/${HEX_COUNT}`);
 
       broadcastToLobby(lobbyKey, {
         type:        'bet_placed',
         lobbyKey,
+        roundId:     lobby.roundId,
         hexNum,
+        acceptedSig,
         playerCount: countHumanPlayers(lobby),
         totalSlots:  HEX_COUNT,
       });
