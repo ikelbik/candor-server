@@ -10,6 +10,7 @@ const PORT           = process.env.PORT || 3001;
 const PROFILE_API_URL = process.env.CONDOR_PROFILE_API_URL || '';
 const ACCEPT_SYNC_TIMEOUT_MS = 5000;
 const HEX_COUNT      = 18;    // positions per lobby
+const BETTING_GRACE_SEC = 2;  // small clock-skew allowance, not a post-result betting window
 
 // Serializes PHP accept calls per player to avoid concurrent FOR UPDATE contention
 const playerAcceptQueues = new Map(); // telegramId → last pending Promise
@@ -111,9 +112,9 @@ function makeLobby(betSize, multiplier, timer = ROUND_DURATION) {
   const hash           = crypto.createHash('sha256')
     .update(`${seed}:${sortedNums.join(',')}`)
     .digest('hex');
-  // bettingDeadline: latest Unix timestamp at which lock_bet is still valid.
-  // timer + 60s buffer covers pendingAccepts delays and slow connections.
-  const bettingDeadline = Math.floor(Date.now() / 1000) + timer + 60;
+  // bettingDeadline: latest Unix timestamp at which a new bet may be locked.
+  // Pending PHP accepts may delay the draw, but must not extend the public betting window.
+  const bettingDeadline = Math.floor(Date.now() / 1000) + timer;
   const sig            = crypto.createHmac('sha256', ROUND_SECRET)
     .update(`${hash}:${bettingDeadline}`)
     .digest('hex');
@@ -278,6 +279,9 @@ function verifyBetTicket(token, lobby, hexNum) {
   if (!Number.isFinite(exp) || exp < now) {
     return { ok: false, reason: 'ticket_expired', detail: { exp, now } };
   }
+  if (now > lobby.bettingDeadline + BETTING_GRACE_SEC) {
+    return { ok: false, reason: 'ticket_betting_closed', detail: { bettingDeadline: lobby.bettingDeadline, now } };
+  }
 
   return { ok: true, telegramId: tid, playerKey: `tg:${tid}` };
 }
@@ -294,6 +298,8 @@ function mapTicketRejectReason(result) {
       return 'Подпись выдана для другого хекса';
     case 'ticket_expired':
       return 'Подтверждение ставки истекло';
+    case 'ticket_betting_closed':
+      return 'Приём ставок завершён';
     case 'ticket_signature_invalid':
       return 'Подпись ставки не прошла проверку';
     default:
@@ -514,6 +520,11 @@ wss.on('connection', (ws, req) => {
 
       if (lobby.phase !== 'betting') {
         send(ws, { type: 'bet_rejected', lobbyKey, roundId: lobby.roundId, hexNum, reason: 'Раунд уже завершён' });
+        return;
+      }
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (nowSec > lobby.bettingDeadline + BETTING_GRACE_SEC) {
+        send(ws, { type: 'bet_rejected', lobbyKey, roundId: lobby.roundId, hexNum, reason: 'Приём ставок завершён' });
         return;
       }
       if (!Number.isInteger(hexNum) || hexNum < 1 || hexNum > HEX_COUNT) {
