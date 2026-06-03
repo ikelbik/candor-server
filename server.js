@@ -422,7 +422,7 @@ function executeDraw(lobby) {
 }
 
 // ─── Connection rate limiting ──────────────────────────────────────────────
-const MAX_CONNS_PER_IP  = 20;   // bot uses 15 connections (5×3), real users ≤ 3
+const MAX_CONNS_PER_IP  = parseInt(process.env.MAX_CONNS_PER_IP || '150', 10);
 const MAX_MSG_BYTES     = 4096; // max incoming message size
 const MSG_RATE_WINDOW   = 1000; // ms window for rate limiting messages
 const MSG_RATE_MAX      = 20;   // max messages per window per connection
