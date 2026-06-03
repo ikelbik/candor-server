@@ -31,8 +31,9 @@ const WINNER_COUNTS = { 2: 9, 3: 6, 6: 3 };
 
 function loadRoundSecretFromPhpConfig() {
   const candidates = [
+    path.resolve(__dirname, '..', 'config_candor.php'),             // js/ → hexwins_us/
+    path.resolve(__dirname, '..', '..', 'config_candor.php'),       // js/ → parent/
     path.resolve(__dirname, '..', '..', '..', 'config_candor.php'),
-    path.resolve(__dirname, '..', '..', '..', '..', 'config_candor.php'),
     path.resolve(__dirname, 'config_candor.php'),
   ];
 
@@ -421,7 +422,7 @@ function executeDraw(lobby) {
 }
 
 // ─── Connection rate limiting ──────────────────────────────────────────────
-const MAX_CONNS_PER_IP  = 10;   // max simultaneous WS connections per IP
+const MAX_CONNS_PER_IP  = 20;   // bot uses 15 connections (5×3), real users ≤ 3
 const MAX_MSG_BYTES     = 4096; // max incoming message size
 const MSG_RATE_WINDOW   = 1000; // ms window for rate limiting messages
 const MSG_RATE_MAX      = 20;   // max messages per window per connection
